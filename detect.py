@@ -86,7 +86,7 @@ class TTSManager:
         self.last_announcement = ""
         self.last_announcement_time = 0
         self.announcement_interval = announcement_interval
-        self.current_detections = set()
+        self.current_detections = defaultdict(int)  # Track object counts
         
         if TTS_AVAILABLE:
             try:
@@ -104,16 +104,22 @@ class TTSManager:
         if not self.engine:
             return
             
-        # Convert detections list to set for efficient comparison
-        new_detections = set(detections)
+        # Convert detections list to count dictionary for accurate comparison
+        new_detections = defaultdict(int)
+        for detection in detections:
+            new_detections[detection] += 1
         
         # Check if it's time to announce and if detections have changed
         time_since_last = current_time - self.last_announcement_time
         
-        if (time_since_last >= self.announcement_interval and 
-            new_detections != self.current_detections):
-            
-            self.current_detections = new_detections
+        # Announce if: interval has passed AND detections changed, OR this is the first detection
+        should_announce = (
+            (time_since_last >= self.announcement_interval and new_detections != self.current_detections) or
+            (not self.current_detections and new_detections)  # First detection
+        )
+        
+        if should_announce:
+            self.current_detections = new_detections.copy()
             self.last_announcement_time = current_time
             
             if new_detections:
@@ -123,13 +129,9 @@ class TTSManager:
     
     def _announce_detections(self, detections):
         """Announce detected objects in a non-blocking way."""
-        # Create announcement text
-        detection_counts = defaultdict(int)
-        for detection in detections:
-            detection_counts[detection] += 1
-        
+        # detections is already a defaultdict(int) with counts
         announcement_parts = []
-        for obj_name, count in detection_counts.items():
+        for obj_name, count in detections.items():
             if count == 1:
                 announcement_parts.append(f"1 {obj_name}")
             else:
