@@ -33,9 +33,20 @@ import csv
 import os
 import platform
 import sys
+import time
 from pathlib import Path
+from collections import defaultdict
+import threading
 
 import torch
+
+# Try to import pyttsx3 for text-to-speech functionality
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+    LOGGER = None  # Will be defined later
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -64,6 +75,83 @@ from utils.general import (
     xyxy2xywh,
 )
 from utils.torch_utils import select_device, smart_inference_mode
+
+
+class TTSManager:
+    """Manages text-to-speech functionality with time-based announcements."""
+    
+    def __init__(self, announcement_interval=5.0):
+        self.engine = None
+        self.lock = threading.Lock()
+        self.last_announcement = ""
+        self.last_announcement_time = 0
+        self.announcement_interval = announcement_interval
+        self.current_detections = set()
+        
+        if TTS_AVAILABLE:
+            try:
+                self.engine = pyttsx3.init()
+                # Configure TTS settings
+                self.engine.setProperty('rate', 150)  # Speed of speech
+                self.engine.setProperty('volume', 0.8)  # Volume level
+                LOGGER.info(f"Text-to-speech engine initialized successfully (announcement interval: {announcement_interval}s)")
+            except Exception as e:
+                LOGGER.warning(f"Failed to initialize text-to-speech engine: {e}")
+                self.engine = None
+    
+    def update_detections(self, detections, current_time):
+        """Update current detections and announce if interval has passed."""
+        if not self.engine:
+            return
+            
+        # Convert detections list to set for efficient comparison
+        new_detections = set(detections)
+        
+        # Check if it's time to announce and if detections have changed
+        time_since_last = current_time - self.last_announcement_time
+        
+        if (time_since_last >= self.announcement_interval and 
+            new_detections != self.current_detections):
+            
+            self.current_detections = new_detections
+            self.last_announcement_time = current_time
+            
+            if new_detections:
+                self._announce_detections(new_detections)
+            else:
+                LOGGER.info("TTS: No objects detected")
+    
+    def _announce_detections(self, detections):
+        """Announce detected objects in a non-blocking way."""
+        # Create announcement text
+        detection_counts = defaultdict(int)
+        for detection in detections:
+            detection_counts[detection] += 1
+        
+        announcement_parts = []
+        for obj_name, count in detection_counts.items():
+            if count == 1:
+                announcement_parts.append(f"1 {obj_name}")
+            else:
+                announcement_parts.append(f"{count} {obj_name}s")
+        
+        announcement = f"Detected: {', '.join(announcement_parts)}"
+        
+        # Log the announcement for debugging
+        LOGGER.info(f"TTS Announcement: {announcement}")
+        
+        # Use threading to avoid blocking the main detection loop
+        def speak():
+            with self.lock:
+                try:
+                    self.engine.say(announcement)
+                    self.engine.runAndWait()
+                    LOGGER.info(f"TTS announcement completed: {announcement}")
+                except Exception as e:
+                    LOGGER.warning(f"TTS announcement failed: {e}")
+        
+        thread = threading.Thread(target=speak, daemon=True)
+        thread.start()
 
 
 @smart_inference_mode()
@@ -97,6 +185,8 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    tts=False,  # enable text-to-speech announcements
+    tts_interval=5.0,  # TTS announcement interval in seconds
 ):
     """
     Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
@@ -133,6 +223,8 @@ def run(
         half (bool): If True, use FP16 half-precision inference. Default is False.
         dnn (bool): If True, use OpenCV DNN backend for ONNX inference. Default is False.
         vid_stride (int): Stride for processing video frames, to skip frames between processing. Default is 1.
+        tts (bool): If True, enable text-to-speech announcements for detected objects. Default is False.
+        tts_interval (float): Time interval between TTS announcements in seconds. Default is 5.0.
 
     Returns:
         None
@@ -148,6 +240,14 @@ def run(
         run(source='data/videos/example.mp4', weights='yolov5s.pt', conf_thres=0.4, device='0')
         ```
     """
+    # Initialize TTS manager if requested
+    tts_manager = None
+    if tts:
+        if not TTS_AVAILABLE:
+            LOGGER.warning("Text-to-speech requested but pyttsx3 is not available. Install with: pip install pyttsx3")
+        else:
+            tts_manager = TTSManager(announcement_interval=tts_interval)
+    
     source = str(source)
     save_img = not nosave and not source.endswith(".txt")  # save inference images
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
@@ -182,6 +282,10 @@ def run(
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
+    
+    # Initialize time tracking for TTS
+    start_time = time.time()
+    
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -242,6 +346,10 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            
+            # Collect detected objects for TTS announcement
+            detected_objects = []
+            
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -257,6 +365,9 @@ def run(
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
+
+                    # Collect object names for TTS
+                    detected_objects.append(names[c])
 
                     if save_csv:
                         write_to_csv(p.name, label, confidence_str)
@@ -278,6 +389,11 @@ def run(
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
+
+            # Update TTS with current detections and time
+            if tts_manager:
+                current_time = time.time() - start_time
+                tts_manager.update_detections(detected_objects, current_time)
 
             # Stream results
             im0 = annotator.result()
@@ -355,6 +471,7 @@ def parse_opt():
         --dnn (bool, optional): Flag to use OpenCV DNN for ONNX inference. Defaults to False.
         --vid-stride (int, optional): Video frame-rate stride, determining the number of frames to skip in between
             consecutive frames. Defaults to 1.
+        --tts (bool, optional): Flag to enable text-to-speech announcements for detected objects. Defaults to False.
 
     Returns:
         argparse.Namespace: Parsed command-line arguments as an argparse.Namespace object.
@@ -400,6 +517,8 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
+    parser.add_argument("--tts", action="store_true", help="enable text-to-speech announcements for detected objects")
+    parser.add_argument("--tts-interval", type=float, default=5.0, help="TTS announcement interval in seconds (default: 5.0)")
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
