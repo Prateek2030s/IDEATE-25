@@ -1,0 +1,51 @@
+# YOLOv8 Object Detection Configuration
+# ====================================
+
+# Model Configuration
+model:
+  path: "yolov8n.pt"  # Model file path (yolov8n.pt, yolov8s.pt, yolov8m.pt, yolov8l.pt, yolov8x.pt)
+  confidence_threshold: 0.25  # Minimum confidence for detections
+  iou_threshold: 0.45  # NMS IoU threshold
+  max_detections: 1000  # Maximum number of detections per image
+
+# Text-to-Speech Configuration
+tts:
+  enabled: false  # Enable/disable TTS functionality
+  announcement_interval: 5.0  # Time interval between announcements (seconds)
+  speech_rate: 150  # Speed of speech (words per minute)
+  volume: 0.8  # Volume level (0.0 to 1.0)
+  voice_id: null  # Specific voice ID (null for default)
+
+# Display Configuration
+display:
+  show_results: false  # Show detection results in window
+  line_thickness: 3  # Bounding box line thickness
+  hide_labels: false  # Hide class labels on bounding boxes
+  hide_confidence: false  # Hide confidence scores on bounding boxes
+  colors: "auto"  # Color scheme for bounding boxes
+
+# Output Configuration
+output:
+  save_results: true  # Save annotated images/videos
+  save_csv: false  # Save detection results to CSV
+  save_txt: false  # Save detection results to YOLO format text files
+  output_dir: "runs/detect_v8"  # Output directory
+  video_codec: "mp4v"  # Video codec for output videos
+
+# Performance Configuration
+performance:
+  device: "auto"  # Device to use (auto, cpu, 0, 1, etc.)
+  half_precision: false  # Use FP16 half-precision inference
+  optimize: true  # Enable model optimization
+
+# Filtering Configuration
+filtering:
+  classes: null  # List of class IDs to detect (null for all classes)
+  agnostic_nms: false  # Class-agnostic NMS
+  augment: false  # Augmented inference
+
+# Logging Configuration
+logging:
+  verbose: true  # Enable verbose logging
+  log_level: "INFO"  # Logging level (DEBUG, INFO, WARNING, ERROR)
+  save_logs: false  # Save logs to file

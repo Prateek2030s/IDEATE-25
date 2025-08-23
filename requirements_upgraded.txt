@@ -1,0 +1,24 @@
+# YOLOv8 + TTS requirements
+# Usage: pip install -r requirements_upgraded.txt
+
+# Core YOLOv8 dependencies
+ultralytics>=8.2.64
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Text-to-Speech functionality
+pyttsx3>=2.90
+
+# Additional utilities
+matplotlib>=3.7.0
+pandas>=2.0.0
+tqdm>=4.65.0
+PyYAML>=6.0
+requests>=2.31.0
+
+# Optional: For better performance
+# onnxruntime>=1.15.0  # For ONNX inference
+# tensorrt>=8.6.0  # For TensorRT inference (NVIDIA GPUs only)
