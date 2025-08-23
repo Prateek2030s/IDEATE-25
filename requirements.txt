@@ -18,6 +18,15 @@ tqdm>=4.66.3
 ultralytics>=8.3.0  # https://ultralytics.com - Latest YOLOv8
 # protobuf<=3.20.1  # https://github.com/ultralytics/yolov5/issues/8012
 
+# Text-to-Speech and OCR ------------------------------------------------------
+pyttsx3>=2.90  # Text-to-speech functionality
+easyocr>=1.7.0  # OCR functionality (recommended)
+pytesseract>=0.3.10  # Alternative OCR engine
+# Note: For pytesseract, you also need to install Tesseract OCR on your system
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+# macOS: brew install tesseract
+# Linux: sudo apt-get install tesseract-ocr
+
 # Logging ---------------------------------------------------------------------
 # tensorboard>=2.4.1
 # clearml>=1.2.0
