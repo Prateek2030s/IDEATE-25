@@ -1,24 +1,18 @@
-#!/usr/bin/env python3
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
-YOLOv8 Object Detection with Text-to-Speech Integration
-=======================================================
+Run YOLOv8 detection inference on images, videos, directories, globs, YouTube, webcam, streams, etc.
 
-This script provides object detection using the latest YOLOv8 model with integrated
-text-to-speech announcements for detected objects. It maintains the same TTS functionality
-as the original YOLOv5 implementation while using the modern Ultralytics YOLOv8 API.
-
-Usage:
-    $ python detect_v8.py --model yolov8n.pt --source 0                    # webcam
-    $ python detect_v8.py --model yolov8n.pt --source img.jpg             # image
-    $ python detect_v8.py --model yolov8n.pt --source vid.mp4             # video
-    $ python detect_v8.py --model yolov8n.pt --source path/               # directory
-    $ python detect_v8.py --model yolov8n.pt --source 'path/*.jpg'        # glob
-    $ python detect_v8.py --model yolov8n.pt --source 'https://youtu.be/LNwODJXcvt4'  # YouTube
-    $ python detect_v8.py --model yolov8n.pt --source 'rtsp://example.com/media.mp4'  # RTSP stream
-
-With TTS:
-    $ python detect_v8.py --model yolov8n.pt --source 0 --tts              # webcam with TTS
-    $ python detect_v8.py --model yolov8n.pt --source vid.mp4 --tts --tts-interval 3.0  # video with TTS every 3s
+Usage - sources:
+    $ python detect_v8.py --weights yolov8n.pt --source 0                               # webcam
+                                                     img.jpg                         # image
+                                                     vid.mp4                         # video
+                                                     screen                          # screenshot
+                                                     path/                           # directory
+                                                     list.txt                        # list of images
+                                                     list.streams                    # list of streams
+                                                     'path/*.jpg'                    # glob
+                                                     'https://youtu.be/LNwODJXcvt4'  # YouTube
+                                                     'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP stream
 """
 
 import argparse
@@ -30,12 +24,10 @@ import time
 from pathlib import Path
 from collections import defaultdict
 import threading
-from typing import List, Dict, Optional, Tuple
 
+import torch
 import cv2
 import numpy as np
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Annotator, colors
 
 # Try to import pyttsx3 for text-to-speech functionality
 try:
@@ -43,13 +35,28 @@ try:
     TTS_AVAILABLE = True
 except ImportError:
     TTS_AVAILABLE = False
-    print("Warning: pyttsx3 not available. Install with: pip install pyttsx3")
+    LOGGER = None  # Will be defined later
+
+# Import YOLOv8
+try:
+    from ultralytics import YOLO
+    from ultralytics.utils import LOGGER
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    LOGGER = None
+
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]  # YOLOv8 root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 
 class TTSManager:
     """Manages text-to-speech functionality with time-based announcements."""
     
-    def __init__(self, announcement_interval: float = 5.0):
+    def __init__(self, announcement_interval=5.0):
         self.engine = None
         self.lock = threading.Lock()
         self.last_announcement = ""
@@ -63,14 +70,14 @@ class TTSManager:
                 # Configure TTS settings
                 self.engine.setProperty('rate', 150)  # Speed of speech
                 self.engine.setProperty('volume', 0.8)  # Volume level
-                print(f"Text-to-speech engine initialized successfully (announcement interval: {announcement_interval}s)")
+                if LOGGER:
+                    LOGGER.info(f"Text-to-speech engine initialized successfully (announcement interval: {announcement_interval}s)")
             except Exception as e:
-                print(f"Warning: Failed to initialize text-to-speech engine: {e}")
+                if LOGGER:
+                    LOGGER.warning(f"Failed to initialize text-to-speech engine: {e}")
                 self.engine = None
-        else:
-            print("Warning: pyttsx3 not available. TTS functionality disabled.")
     
-    def update_detections(self, detections: List[str], current_time: float):
+    def update_detections(self, detections, current_time):
         """Update current detections and announce if interval has passed."""
         if not self.engine:
             return
@@ -96,10 +103,12 @@ class TTSManager:
             if new_detections:
                 self._announce_detections(new_detections)
             else:
-                print("TTS: No objects detected")
+                if LOGGER:
+                    LOGGER.info("TTS: No objects detected")
     
-    def _announce_detections(self, detections: Dict[str, int]):
+    def _announce_detections(self, detections):
         """Announce detected objects in a non-blocking way."""
+        # detections is already a defaultdict(int) with counts
         announcement_parts = []
         for obj_name, count in detections.items():
             if count == 1:
@@ -110,7 +119,8 @@ class TTSManager:
         announcement = f"Detected: {', '.join(announcement_parts)}"
         
         # Log the announcement for debugging
-        print(f"TTS Announcement: {announcement}")
+        if LOGGER:
+            LOGGER.info(f"TTS Announcement: {announcement}")
         
         # Use threading to avoid blocking the main detection loop
         def speak():
@@ -118,304 +128,222 @@ class TTSManager:
                 try:
                     self.engine.say(announcement)
                     self.engine.runAndWait()
-                    print(f"TTS announcement completed: {announcement}")
+                    if LOGGER:
+                        LOGGER.info(f"TTS announcement completed: {announcement}")
                 except Exception as e:
-                    print(f"Warning: TTS announcement failed: {e}")
+                    if LOGGER:
+                        LOGGER.warning(f"TTS announcement failed: {e}")
         
         thread = threading.Thread(target=speak, daemon=True)
         thread.start()
 
-class YOLOv8Detector:
-    """YOLOv8-based object detector with TTS integration."""
-    
-    def __init__(self, model_path: str, conf_threshold: float = 0.25, iou_threshold: float = 0.45):
-        self.model = YOLO(model_path)
-        self.conf_threshold = conf_threshold
-        self.iou_threshold = iou_threshold
-        self.tts_manager = None
-        
-    def set_tts(self, enabled: bool, interval: float = 5.0):
-        """Enable or disable TTS functionality."""
-        if enabled:
-            if not TTS_AVAILABLE:
-                print("Warning: TTS requested but pyttsx3 is not available. Install with: pip install pyttsx3")
-                return
-            self.tts_manager = TTSManager(announcement_interval=interval)
-            print(f"TTS enabled with {interval}s announcement interval")
+
+def run(
+    weights=ROOT / "yolov8n.pt",  # model path or triton URL
+    source=ROOT / "data/images",  # file/dir/URL/glob/screen/0(webcam)
+    data=ROOT / "data/coco128.yaml",  # dataset.yaml path
+    imgsz=(640, 640),  # inference size (height, width)
+    conf_thres=0.25,  # confidence threshold
+    iou_thres=0.45,  # NMS IOU threshold
+    max_det=1000,  # maximum detections per image
+    device="",  # cuda device, i.e. 0 or 0,1,2,3 or cpu
+    view_img=False,  # show results
+    save_txt=False,  # save results to *.txt
+    save_format=0,  # save boxes coordinates in YOLO format or Pascal-VOC format (0 for YOLO and 1 for Pascal-VOC)
+    save_csv=False,  # save results in CSV format
+    save_conf=False,  # save confidences in --save-txt labels
+    save_crop=False,  # save cropped prediction boxes
+    nosave=False,  # do not save images/videos
+    classes=None,  # filter by class: --class 0, or --class 0 2 3
+    agnostic_nms=False,  # class-agnostic NMS
+    augment=False,  # augmented inference
+    visualize=False,  # visualize features
+    update=False,  # update all models
+    project=ROOT / "runs/detect",  # save results to project/name
+    name="exp",  # save results to project/name
+    exist_ok=False,  # existing project/name ok, do not increment
+    line_thickness=3,  # bounding box thickness (pixels)
+    hide_labels=False,  # hide labels
+    hide_conf=False,  # hide confidences
+    half=False,  # use FP16 half-precision inference
+    dnn=False,  # use OpenCV DNN for ONNX inference
+    vid_stride=1,  # video frame-rate stride
+    tts=False,  # enable text-to-speech announcements
+    tts_interval=5.0,  # TTS announcement interval in seconds
+):
+    """
+    Runs YOLOv8 detection inference on various sources like images, videos, directories, streams, etc.
+    """
+    # Initialize TTS manager if requested
+    tts_manager = None
+    if tts:
+        if not TTS_AVAILABLE:
+            if LOGGER:
+                LOGGER.warning("Text-to-speech requested but pyttsx3 is not available. Install with: pip install pyttsx3")
         else:
-            self.tts_manager = None
+            tts_manager = TTSManager(announcement_interval=tts_interval)
     
-    def detect_image(self, image_path: str, save_path: Optional[str] = None, 
-                    show_result: bool = False) -> List[Dict]:
-        """Detect objects in a single image."""
-        results = self.model(image_path, conf=self.conf_threshold, iou=self.iou_threshold)
-        
-        detections = []
-        for result in results:
-            if result.boxes is not None:
-                boxes = result.boxes
-                for box in boxes:
-                    detection = {
-                        'class': int(box.cls[0]),
-                        'class_name': result.names[int(box.cls[0])],
-                        'confidence': float(box.conf[0]),
-                        'bbox': box.xyxy[0].cpu().numpy().tolist()
-                    }
-                    detections.append(detection)
-        
-        # Process TTS if enabled
-        if self.tts_manager:
-            detected_objects = [det['class_name'] for det in detections]
-            current_time = time.time()
-            self.tts_manager.update_detections(detected_objects, current_time)
-        
-        # Save or show result
-        if save_path or show_result:
-            annotated_img = results[0].plot()
-            if save_path:
-                cv2.imwrite(save_path, annotated_img)
-            if show_result:
-                cv2.imshow('YOLOv8 Detection', annotated_img)
-                cv2.waitKey(0)
-                cv2.destroyAllWindows()
-        
-        return detections
+    source = str(source)
+    save_img = not nosave and not source.endswith(".txt")  # save inference images
     
-    def detect_video(self, video_path: str, output_path: Optional[str] = None,
-                    show_result: bool = False, save_csv: bool = False) -> List[Dict]:
-        """Detect objects in a video file or stream."""
-        cap = cv2.VideoCapture(video_path)
+    # Directories
+    save_dir = Path(project) / name
+    save_dir.mkdir(parents=True, exist_ok=True)  # make dir
+    if save_txt:
+        (save_dir / "labels").mkdir(parents=True, exist_ok=True)
+
+    # Load model
+    model = YOLO(weights)
+    if device:
+        model.to(device)
+    
+    # Get class names
+    names = model.names
+    
+    # Initialize time tracking for TTS
+    start_time = time.time()
+    
+    # Check if source is webcam
+    is_webcam = source == "0" or source.isdigit()
+    
+    if is_webcam:
+        # Webcam mode with real-time display and TTS
+        cap = cv2.VideoCapture(int(source))
         if not cap.isOpened():
-            print(f"Error: Could not open video source: {video_path}")
-            return []
-        
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Setup video writer if output path is specified
-        writer = None
-        if output_path:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        # Setup CSV writer if requested
-        csv_writer = None
-        csv_file = None
-        if save_csv:
-            csv_path = output_path.replace('.mp4', '.csv') if output_path else 'detections.csv'
-            csv_file = open(csv_path, 'w', newline='')
-            csv_writer = csv.writer(csv_file)
-            csv_writer.writerow(['Frame', 'Class', 'Class_Name', 'Confidence', 'X1', 'Y1', 'X2', 'Y2'])
-        
-        frame_count = 0
-        all_detections = []
-        start_time = time.time()
-        
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                frame_count += 1
-                
-                # Run detection
-                results = self.model(frame, conf=self.conf_threshold, iou=self.iou_threshold)
-                
-                frame_detections = []
-                for result in results:
-                    if result.boxes is not None:
-                        boxes = result.boxes
-                        for box in boxes:
-                            detection = {
-                                'frame': frame_count,
-                                'class': int(box.cls[0]),
-                                'class_name': result.names[int(box.cls[0])],
-                                'confidence': float(box.conf[0]),
-                                'bbox': box.xyxy[0].cpu().numpy().tolist()
-                            }
-                            frame_detections.append(detection)
-                            
-                            # Write to CSV if requested
-                            if csv_writer:
-                                x1, y1, x2, y2 = detection['bbox']
-                                csv_writer.writerow([
-                                    frame_count, detection['class'], detection['class_name'],
-                                    detection['confidence'], x1, y1, x2, y2
-                                ])
-                
-                all_detections.extend(frame_detections)
-                
-                # Process TTS if enabled
-                if self.tts_manager:
-                    detected_objects = [det['class_name'] for det in frame_detections]
-                    current_time = time.time() - start_time
-                    self.tts_manager.update_detections(detected_objects, current_time)
-                
-                # Draw results
-                annotated_frame = results[0].plot()
-                
-                # Save frame if writer is available
-                if writer:
-                    writer.write(annotated_frame)
-                
-                # Show frame if requested
-                if show_result:
-                    cv2.imshow('YOLOv8 Detection', annotated_frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                
-                # Print progress
-                if frame_count % 30 == 0:  # Every 30 frames
-                    print(f"Processed {frame_count} frames...")
-        
-        finally:
-            cap.release()
-            if writer:
-                writer.release()
-            if csv_file:
-                csv_file.close()
-            if show_result:
-                cv2.destroyAllWindows()
-        
-        print(f"Video processing completed. Total frames: {frame_count}")
-        return all_detections
-    
-    def detect_webcam(self, camera_id: int = 0, show_result: bool = True):
-        """Detect objects from webcam feed."""
-        cap = cv2.VideoCapture(camera_id)
-        if not cap.isOpened():
-            print(f"Error: Could not open camera {camera_id}")
+            if LOGGER:
+                LOGGER.error(f"Failed to open webcam {source}")
             return
         
-        print(f"Starting webcam detection on camera {camera_id}. Press 'q' to quit.")
-        
+        # Initialize time tracking for TTS
         start_time = time.time()
+        last_tts_time = 0
         
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    print("Error: Could not read frame from camera")
-                    break
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
                 
-                # Run detection
-                results = self.model(frame, conf=self.conf_threshold, iou=self.iou_threshold)
-                
-                # Process TTS if enabled
-                if self.tts_manager:
-                    detected_objects = []
-                    for result in results:
-                        if result.boxes is not None:
-                            for box in result.boxes:
-                                class_name = result.names[int(box.cls[0])]
-                                detected_objects.append(class_name)
-                    
-                    current_time = time.time() - start_time
-                    self.tts_manager.update_detections(detected_objects, current_time)
-                
-                # Draw results
-                annotated_frame = results[0].plot()
-                
-                # Show frame
-                if show_result:
-                    cv2.imshow('YOLOv8 Webcam Detection', annotated_frame)
-                
-                # Check for quit
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            # Run inference on current frame
+            results = model(frame, conf=conf_thres, iou=iou_thres, classes=classes, 
+                          agnostic_nms=agnostic_nms, max_det=max_det, augment=augment,
+                          verbose=False)
+            
+            # Process results and draw bounding boxes
+            annotated_frame = frame.copy()
+            detected_objects = []
+            
+            for result in results:
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        # Get box coordinates and class
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        cls = int(box.cls.item())
+                        conf = float(box.conf.item())
+                        
+                        # Draw bounding box
+                        color = (0, 255, 0)  # Green
+                        cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                        
+                        # Add label
+                        label = f"{names[cls]} {conf:.2f}"
+                        cv2.putText(annotated_frame, label, (int(x1), int(y1) - 10), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        
+                        # Collect for TTS
+                        detected_objects.append(names[cls])
+            
+            # TTS announcement for webcam
+            if tts_manager and detected_objects:
+                current_time = time.time() - start_time
+                if current_time - last_tts_time >= tts_manager.announcement_interval:
+                    tts_manager.update_detections(detected_objects, current_time)
+                    last_tts_time = current_time
+            
+            # Display the frame
+            cv2.imshow('YOLOv8 Detection', annotated_frame)
+            
+            # Break on 'q' key
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
         
-        finally:
-            cap.release()
-            cv2.destroyAllWindows()
-            print("Webcam detection stopped.")
-
-
-def main():
-    """Main function to run YOLOv8 detection with TTS."""
-    parser = argparse.ArgumentParser(description='YOLOv8 Object Detection with TTS')
-    parser.add_argument('--model', type=str, default='yolov8n.pt', 
-                       help='YOLOv8 model path (default: yolov8n.pt)')
-    parser.add_argument('--source', type=str, required=True,
-                       help='Source: image, video, directory, or camera ID (0 for webcam)')
-    parser.add_argument('--conf', type=float, default=0.25,
-                       help='Confidence threshold (default: 0.25)')
-    parser.add_argument('--iou', type=float, default=0.45,
-                       help='NMS IoU threshold (default: 0.45)')
-    parser.add_argument('--output', type=str, default=None,
-                       help='Output path for results')
-    parser.add_argument('--show', action='store_true',
-                       help='Show results in window')
-    parser.add_argument('--save-csv', action='store_true',
-                       help='Save detection results to CSV')
-    parser.add_argument('--tts', action='store_true',
-                       help='Enable text-to-speech announcements')
-    parser.add_argument('--tts-interval', type=float, default=5.0,
-                       help='TTS announcement interval in seconds (default: 5.0)')
-    
-    args = parser.parse_args()
-    
-    # Initialize detector
-    detector = YOLOv8Detector(args.model, args.conf, args.iou)
-    
-    # Setup TTS if requested
-    if args.tts:
-        detector.set_tts(True, args.tts_interval)
-    
-    # Determine source type and run detection
-    source = args.source
-    
-    if source.isdigit() or source == '0':
-        # Webcam
-        camera_id = int(source)
-        detector.detect_webcam(camera_id, args.show)
-    
-    elif os.path.isfile(source):
-        # Single file (image or video)
-        file_ext = Path(source).suffix.lower()
+        cap.release()
+        cv2.destroyAllWindows()
         
-        if file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-            # Image
-            print(f"Detecting objects in image: {source}")
-            detections = detector.detect_image(source, args.output, args.show)
-            print(f"Found {len(detections)} objects")
-            for det in detections:
-                print(f"  {det['class_name']}: {det['confidence']:.2f}")
-        
-        elif file_ext in ['.mp4', '.avi', '.mov', '.mkv']:
-            # Video
-            print(f"Detecting objects in video: {source}")
-            detections = detector.detect_video(source, args.output, args.show, args.save_csv)
-            print(f"Total detections: {len(detections)}")
-    
-    elif os.path.isdir(source):
-        # Directory of images
-        print(f"Processing directory: {source}")
-        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-        image_files = []
-        
-        for ext in image_extensions:
-            image_files.extend(Path(source).glob(f'*{ext}'))
-            image_files.extend(Path(source).glob(f'*{ext.upper()}'))
-        
-        if not image_files:
-            print(f"No image files found in directory: {source}")
-            return
-        
-        print(f"Found {len(image_files)} images")
-        
-        for img_path in image_files:
-            print(f"Processing: {img_path.name}")
-            detections = detector.detect_image(str(img_path), None, False)
-            print(f"  Found {len(detections)} objects")
-    
     else:
-        print(f"Error: Invalid source '{source}'. Please provide a valid file, directory, or camera ID.")
-        return
+        # Regular file/directory mode
+        results = model(source, conf=conf_thres, iou=iou_thres, classes=classes, 
+                       agnostic_nms=agnostic_nms, max_det=max_det, augment=augment,
+                       save=save_img, save_txt=save_txt, save_conf=save_conf,
+                       project=project, name=name, exist_ok=exist_ok,
+                       line_width=line_thickness, show_labels=not hide_labels,
+                       show_conf=not hide_conf, vid_stride=vid_stride)
+        
+        # Process results for TTS
+        for result in results:
+            if tts_manager:
+                current_time = time.time() - start_time
+                
+                # Collect detected objects for TTS announcement
+                detected_objects = []
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        cls = int(box.cls.item())
+                        detected_objects.append(names[cls])
+                
+                tts_manager.update_detections(detected_objects, current_time)
+        
+        # Print results
+        if LOGGER:
+            LOGGER.info(f"Results saved to {save_dir}")
+    
+    if update:
+        pass  # update model functionality removed for simplicity
+
+
+def parse_opt():
+    """Parse command-line arguments for YOLOv8 detection."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov8n.pt", help="model path or triton URL")
+    parser.add_argument("--source", type=str, default=ROOT / "data/images", help="file/dir/URL/glob/screen/0(webcam)")
+    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="(optional) dataset.yaml path")
+    parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
+    parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
+    parser.add_argument("--iou-thres", type=float, default=0.45, help="NMS IoU threshold")
+    parser.add_argument("--max-det", type=int, default=1000, help="maximum detections per image")
+    parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
+    parser.add_argument("--view-img", action="store_true", help="show results")
+    parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
+    parser.add_argument("--save-format", type=int, default=0, help="save format (0=YOLO, 1=Pascal-VOC)")
+    parser.add_argument("--save-csv", action="store_true", help="save results in CSV format")
+    parser.add_argument("--save-conf", action="store_true", help="save confidences in --save-txt labels")
+    parser.add_argument("--save-crop", action="store_true", help="save cropped prediction boxes")
+    parser.add_argument("--nosave", action="store_true", help="do not save images/videos")
+    parser.add_argument("--classes", nargs="+", type=int, help="filter by class: --classes 0, or --classes 0 2 3")
+    parser.add_argument("--agnostic-nms", action="store_true", help="class-agnostic NMS")
+    parser.add_argument("--augment", action="store_true", help="augmented inference")
+    parser.add_argument("--visualize", action="store_true", help="visualize features")
+    parser.add_argument("--update", action="store_true", help="update all models")
+    parser.add_argument("--project", default=ROOT / "runs/detect", help="save results to project/name")
+    parser.add_argument("--name", default="exp", help="save results to project/name")
+    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
+    parser.add_argument("--line-thickness", default=3, type=int, help="bounding box thickness (pixels)")
+    parser.add_argument("--hide-labels", default=False, action="store_true", help="hide labels")
+    parser.add_argument("--hide-conf", default=False, action="store_true", help="hide confidences")
+    parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
+    parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
+    parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
+    parser.add_argument("--tts", action="store_true", help="enable text-to-speech announcements for detected objects")
+    parser.add_argument("--tts-interval", type=float, default=5.0, help="TTS announcement interval in seconds (default: 5.0)")
+    opt = parser.parse_args()
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
+    return opt
+
+
+def main(opt):
+    """Execute YOLOv8 model inference."""
+    run(**vars(opt))
 
 
 if __name__ == "__main__":
-    main()
-
+    opt = parse_opt()
+    main(opt)
