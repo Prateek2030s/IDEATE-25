@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from collections import defaultdict
 import threading
+import json
 
 import torch
 
@@ -47,6 +48,20 @@ try:
 except ImportError:
     TTS_AVAILABLE = False
     LOGGER = None  # Will be defined later
+
+# Try to import OpenAI for AI-powered descriptions
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# Try to import keyboard for spacebar detection
+try:
+    import keyboard
+    KEYBOARD_AVAILABLE = True
+except ImportError:
+    KEYBOARD_AVAILABLE = False
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -77,17 +92,128 @@ from utils.general import (
 from utils.torch_utils import select_device, smart_inference_mode
 
 
-class TTSManager:
-    """Manages text-to-speech functionality with time-based announcements."""
+class AIDescriptionGenerator:
+    """Generates AI-powered descriptions for detected objects."""
     
-    def __init__(self, announcement_interval=5.0):
+    def __init__(self, api_key=None, model="gpt-3.5-turbo"):
+        self.client = None
+        self.model = model
+        
+        if OPENAI_AVAILABLE and api_key:
+            try:
+                openai.api_key = api_key
+                self.client = openai
+                LOGGER.info(f"AI description generator initialized with model: {model}")
+            except Exception as e:
+                LOGGER.warning(f"Failed to initialize OpenAI client: {e}")
+                self.client = None
+        elif not OPENAI_AVAILABLE:
+            LOGGER.warning("OpenAI not available. Install with: pip install openai")
+        elif not api_key:
+            LOGGER.warning("OpenAI API key not provided. Set OPENAI_API_KEY environment variable.")
+    
+    def generate_descriptions(self, detected_objects):
+        """Generate AI-powered descriptions for detected objects."""
+        if not self.client or not detected_objects:
+            return self._generate_fallback_descriptions(detected_objects)
+        
+        try:
+            # Create a prompt for the AI model
+            objects_text = ", ".join([f"{count} {obj}" for obj, count in detected_objects.items()])
+            prompt = f"""Generate a brief, engaging one-liner description for each of these detected objects: {objects_text}. 
+            Format: Return only a JSON array with one description per object, like: ["A sleek modern vehicle", "A person in casual attire"].
+            Keep descriptions under 10 words each and make them conversational."""
+            
+            response = self.client.ChatCompletion.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful AI assistant that generates brief, engaging descriptions of objects detected in images."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=150,
+                temperature=0.7
+            )
+            
+            # Parse the response
+            content = response.choices[0].message.content.strip()
+            try:
+                # Try to extract JSON from the response
+                if "[" in content and "]" in content:
+                    start = content.find("[")
+                    end = content.rfind("]") + 1
+                    json_str = content[start:end]
+                    descriptions = json.loads(json_str)
+                    
+                    # Ensure we have the right number of descriptions
+                    if len(descriptions) == len(detected_objects):
+                        return list(descriptions)
+            except (json.JSONDecodeError, IndexError):
+                pass
+            
+            # Fallback: split by newlines or commas
+            descriptions = [desc.strip().strip('"').strip("'") for desc in content.split('\n') if desc.strip()]
+            if len(descriptions) >= len(detected_objects):
+                return descriptions[:len(detected_objects)]
+            
+        except Exception as e:
+            LOGGER.warning(f"AI description generation failed: {e}")
+        
+        return self._generate_fallback_descriptions(detected_objects)
+    
+    def _generate_fallback_descriptions(self, detected_objects):
+        """Generate simple fallback descriptions when AI is not available."""
+        fallback_descriptions = {
+            "person": "A person in the scene",
+            "car": "A vehicle on the road",
+            "truck": "A large transport vehicle",
+            "bus": "A public transport bus",
+            "motorcycle": "A two-wheeled vehicle",
+            "bicycle": "A pedal-powered bicycle",
+            "dog": "A friendly canine companion",
+            "cat": "A feline friend",
+            "bird": "A feathered creature",
+            "chair": "A seating furniture piece",
+            "table": "A flat surface for work or dining",
+            "laptop": "A portable computing device",
+            "phone": "A mobile communication device",
+            "book": "A source of knowledge and stories",
+            "cup": "A container for beverages",
+            "bottle": "A vessel for liquids",
+            "bag": "A container for carrying items",
+            "backpack": "A bag worn on the back",
+            "umbrella": "Protection from rain or sun",
+            "clock": "A time-keeping device"
+        }
+        
+        descriptions = []
+        for obj in detected_objects.keys():
+            if obj in fallback_descriptions:
+                descriptions.append(fallback_descriptions[obj])
+            else:
+                descriptions.append(f"A {obj} in the scene")
+        
+        return descriptions
+
+
+class TTSManager:
+    """Manages text-to-speech functionality with AI-powered descriptions and spacebar triggering."""
+    
+    def __init__(self, announcement_interval=5.0, ai_api_key=None, enable_ai=True):
         self.engine = None
         self.lock = threading.Lock()
         self.last_announcement = ""
         self.last_announcement_time = 0
         self.announcement_interval = announcement_interval
         self.current_detections = defaultdict(int)  # Track object counts
+        self.spacebar_pressed = False
+        self.ai_generator = None
+        self.enable_ai = enable_ai
         
+        # Initialize AI description generator
+        if enable_ai:
+            self.ai_generator = AIDescriptionGenerator(api_key=ai_api_key)
+        
+        # Initialize TTS engine
         if TTS_AVAILABLE:
             try:
                 self.engine = pyttsx3.init()
@@ -98,9 +224,23 @@ class TTSManager:
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize text-to-speech engine: {e}")
                 self.engine = None
+        
+        # Set up spacebar monitoring if keyboard is available
+        if KEYBOARD_AVAILABLE:
+            try:
+                keyboard.on_press_key("space", self._on_spacebar_press)
+                LOGGER.info("Spacebar monitoring enabled - press SPACE to trigger AI descriptions")
+            except Exception as e:
+                LOGGER.warning(f"Failed to set up spacebar monitoring: {e}")
+    
+    def _on_spacebar_press(self, e):
+        """Handle spacebar press events."""
+        if e.name == "space":
+            self.spacebar_pressed = True
+            LOGGER.info("Spacebar pressed - triggering AI description generation")
     
     def update_detections(self, detections, current_time):
-        """Update current detections and announce if interval has passed."""
+        """Update current detections and announce if interval has passed or spacebar was pressed."""
         if not self.engine:
             return
             
@@ -108,6 +248,12 @@ class TTSManager:
         new_detections = defaultdict(int)
         for detection in detections:
             new_detections[detection] += 1
+        
+        # Check if spacebar was pressed
+        if self.spacebar_pressed:
+            self.spacebar_pressed = False
+            self._announce_with_ai_descriptions(new_detections)
+            return
         
         # Check if it's time to announce and if detections have changed
         time_since_last = current_time - self.last_announcement_time
@@ -128,8 +274,7 @@ class TTSManager:
                 LOGGER.info("TTS: No objects detected")
     
     def _announce_detections(self, detections):
-        """Announce detected objects in a non-blocking way."""
-        # detections is already a defaultdict(int) with counts
+        """Announce detected objects in a simple format."""
         announcement_parts = []
         for obj_name, count in detections.items():
             if count == 1:
@@ -138,7 +283,44 @@ class TTSManager:
                 announcement_parts.append(f"{count} {obj_name}s")
         
         announcement = f"Detected: {', '.join(announcement_parts)}"
+        self._speak_announcement(announcement)
+    
+    def _announce_with_ai_descriptions(self, detections):
+        """Announce detected objects with AI-generated descriptions."""
+        if not detections:
+            self._speak_announcement("No objects detected")
+            return
         
+        # Generate AI descriptions
+        if self.ai_generator and self.enable_ai:
+            descriptions = self.ai_generator.generate_descriptions(detections)
+            
+            # Create enhanced announcement
+            announcement_parts = []
+            for i, (obj_name, count) in enumerate(detections.items()):
+                if i < len(descriptions):
+                    desc = descriptions[i]
+                    if count == 1:
+                        announcement_parts.append(f"1 {obj_name}: {desc}")
+                    else:
+                        announcement_parts.append(f"{count} {obj_name}s: {desc}")
+                else:
+                    # Fallback if AI didn't generate enough descriptions
+                    if count == 1:
+                        announcement_parts.append(f"1 {obj_name}")
+                    else:
+                        announcement_parts.append(f"{count} {obj_name}s")
+            
+            announcement = f"AI Analysis: {'. '.join(announcement_parts)}"
+        else:
+            # Fallback to simple announcement
+            self._announce_detections(detections)
+            return
+        
+        self._speak_announcement(announcement)
+    
+    def _speak_announcement(self, announcement):
+        """Speak the announcement in a non-blocking way."""
         # Log the announcement for debugging
         LOGGER.info(f"TTS Announcement: {announcement}")
         
@@ -189,6 +371,8 @@ def run(
     vid_stride=1,  # video frame-rate stride
     tts=False,  # enable text-to-speech announcements
     tts_interval=5.0,  # TTS announcement interval in seconds
+    ai_api_key=None,  # API key for OpenAI (if enabled)
+    enable_ai=True,  # Enable AI-powered descriptions
 ):
     """
     Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
@@ -227,6 +411,8 @@ def run(
         vid_stride (int): Stride for processing video frames, to skip frames between processing. Default is 1.
         tts (bool): If True, enable text-to-speech announcements for detected objects. Default is False.
         tts_interval (float): Time interval between TTS announcements in seconds. Default is 5.0.
+        ai_api_key (str, optional): API key for OpenAI (if enabled). Default is None.
+        enable_ai (bool): If True, enable AI-powered descriptions. Default is True.
 
     Returns:
         None
@@ -248,7 +434,10 @@ def run(
         if not TTS_AVAILABLE:
             LOGGER.warning("Text-to-speech requested but pyttsx3 is not available. Install with: pip install pyttsx3")
         else:
-            tts_manager = TTSManager(announcement_interval=tts_interval)
+            # Get API key from environment if not provided
+            if not ai_api_key:
+                ai_api_key = os.getenv('OPENAI_API_KEY')
+            tts_manager = TTSManager(announcement_interval=tts_interval, ai_api_key=ai_api_key, enable_ai=enable_ai)
     
     source = str(source)
     save_img = not nosave and not source.endswith(".txt")  # save inference images
@@ -474,6 +663,9 @@ def parse_opt():
         --vid-stride (int, optional): Video frame-rate stride, determining the number of frames to skip in between
             consecutive frames. Defaults to 1.
         --tts (bool, optional): Flag to enable text-to-speech announcements for detected objects. Defaults to False.
+        --tts-interval (float, optional): TTS announcement interval in seconds (default: 5.0).
+        --ai-api-key (str, optional): API key for OpenAI (if enabled). Default is None.
+        --enable-ai (bool, optional): Flag to enable AI-powered descriptions. Default is True.
 
     Returns:
         argparse.Namespace: Parsed command-line arguments as an argparse.Namespace object.
@@ -521,6 +713,8 @@ def parse_opt():
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
     parser.add_argument("--tts", action="store_true", help="enable text-to-speech announcements for detected objects")
     parser.add_argument("--tts-interval", type=float, default=5.0, help="TTS announcement interval in seconds (default: 5.0)")
+    parser.add_argument("--ai-api-key", type=str, default=None, help="API key for OpenAI (if enabled)")
+    parser.add_argument("--enable-ai", action="store_true", default=True, help="enable AI-powered descriptions (default: True)")
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
